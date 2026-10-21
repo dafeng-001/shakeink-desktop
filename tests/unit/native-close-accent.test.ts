@@ -140,6 +140,19 @@ test("CLOSE-07 caption canvas retains transparent padding and correct whole-pixe
   }
 })
 
+test("CLOSE-09 mixed-DPI crossing clamps the phase instead of producing a negative canvas offset", async () => {
+  const { closeCaptionPhase, closeCaptionBitmap } = await load()
+  // Primary 200% / secondary 125%: during the crossing display matching already
+  // reports the secondary while DIP projection still uses the primary, which
+  // used to return x:-1045 and crash Buffer.copy with targetStart -1308.
+  const phase = closeCaptionPhase({ x: 0, y: 0, width: 1440, height: 940 }, { x: 1394, y: 1, width: 46, height: 31 }, 1.25,
+    rect => ({ ...rect, x: Math.round(rect.x * 2), y: Math.round(rect.y * 2) }))
+  assert.deepEqual(phase, { x: -1, y: -1 })
+  const bitmap = closeCaptionBitmap(1.25, "#2b251b", { width: 46, height: 31 }, phase)
+  assert.equal(bitmap.width, 58); assert.equal(bitmap.height, 39)
+  assert(bitmap.pixels.some((value, index) => index % 4 === 3 && value > 0))
+})
+
 test("CLOSE-08 projection and scale changes repaint at identical DIP bounds, reshape, and include the maximized top hover edge", async () => {
   const f = await fixture(), bounds = { ...f.decoration.bounds }, first = f.images.at(-1), count = f.images.length
   f.projectionShift(1); f.tick(); assert.deepEqual(f.decoration.bounds, bounds); assert.equal(f.images.length, count + 1); assert.notDeepEqual(f.images.at(-1).pixels, first.pixels)

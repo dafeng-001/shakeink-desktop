@@ -17,8 +17,14 @@ export function closeCaptionPhase(content: Rect, bounds: Rect, scale: number, pr
   const start = project({ ...content, width: 0, height: 0 }), host = project({ ...bounds, width: 0, height: 0 })
   // The native symbol is rounded in its owner's local client coordinates.
   // An independently positioned window rounds its screen origin separately.
-  return { x: start.x + Math.round((bounds.x - content.x) * scale) - host.x,
-    y: start.y + Math.round((bounds.y - content.y) * scale) - host.y }
+  // While a window crosses monitors with different scale factors, display
+  // matching and the owner's DIP projection can briefly disagree on that
+  // scale; the residual then grows by the window width and would hand the
+  // canvas a negative offset. A whole-pixel phase is only ever a rounding
+  // residual, so keep it within one pixel of either edge.
+  const clamp = (value: number) => Math.max(-1, Math.min(1, value))
+  return { x: clamp(start.x + Math.round((bounds.x - content.x) * scale) - host.x),
+    y: clamp(start.y + Math.round((bounds.y - content.y) * scale) - host.y) }
 }
 
 export function closeGlyphBitmap(scaleFactor: number, color: string) {
