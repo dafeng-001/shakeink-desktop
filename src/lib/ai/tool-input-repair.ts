@@ -107,8 +107,68 @@ export function parsePlanningToolJson(raw: string): unknown {
   }
 }
 
+/** 该位置声明的容器类型（anyOf/oneOf 递归展开），用于判断 JSON 字符串该不该还原。 */
+function declaredTypes(schema: Record<string, unknown>): Set<string> {
+  const types = new Set<string>()
+  const add = (type: unknown) => { if (typeof type === "string") types.add(type) }
+  add(schema.type)
+  if (Array.isArray(schema.type)) schema.type.forEach(add)
+  return types
+}
+
+function containerTypes(schema: Record<string, unknown>): Set<string> {
+  const types = declaredTypes(schema)
+  for (const key of ["anyOf", "oneOf"]) {
+    const branches = schema[key]
+    if (!Array.isArray(branches)) continue
+    for (const branch of branches) {
+      if (branch && typeof branch === "object") {
+        for (const type of containerTypes(branch as Record<string, unknown>)) types.add(type)
+      }
+    }
+  }
+  return types
+}
+
+/** 还原后的容器继续按命中的分支规整内部字段（如数字字符串）。 */
+function matchingContainerSchema(schema: Record<string, unknown>, parsed: Record<string, unknown> | unknown[]): Record<string, unknown> {
+  const wantsArray = Array.isArray(parsed)
+  const direct = declaredTypes(schema)
+  if (wantsArray ? direct.has("array") : direct.has("object")) return schema
+  for (const key of ["anyOf", "oneOf"]) {
+    const branches = schema[key]
+    if (!Array.isArray(branches)) continue
+    for (const branch of branches) {
+      if (!branch || typeof branch !== "object") continue
+      const types = declaredTypes(branch as Record<string, unknown>)
+      if (wantsArray ? types.has("array") : types.has("object")) return branch as Record<string, unknown>
+    }
+  }
+  return schema
+}
+
+/** 只在 schema 明确期望对象/数组时还原同构 JSON 文本；普通字符串字段不改写。 */
+function parseEncodedContainer(value: string, schema: Record<string, unknown>): Record<string, unknown> | unknown[] | undefined {
+  const types = containerTypes(schema)
+  if (!types.has("object") && !types.has("array")) return undefined
+  // 联合同时允许字符串时无法区分作者原文与被编码的容器，保持原样。
+  if (types.has("string")) return undefined
+  const text = value.trim()
+  if (!text.startsWith("{") && !text.startsWith("[")) return undefined
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (types.has("object") && parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>
+    if (types.has("array") && Array.isArray(parsed)) return parsed
+  } catch { return undefined }
+  return undefined
+}
+
 /** 仅修复无歧义的编码/类型问题，不补造 ID、版本、内容或作者选择。 */
 export function normalizeToolInput(value: unknown, schema: Record<string, unknown>): unknown {
+  if (typeof value === "string") {
+    const parsed = parseEncodedContainer(value, schema)
+    if (parsed !== undefined) return normalizeToolInput(parsed, matchingContainerSchema(schema, parsed))
+  }
   const type = schema.type
   if ((type === "number" || type === "integer") && typeof value === "string" && /^-?\d+(?:\.\d+)?$/.test(value.trim())) return Number(value)
   if (type === "boolean" && (value === "true" || value === "false")) return value === "true"
@@ -149,6 +209,24 @@ export const repairToolInput: ToolCallRepairFunction<ToolSet> = async ({ toolCal
   } catch { return null }
 }
 
+/** Zod invalid_type 的 issue.input 对联合分支可能是 undefined，必须按路径回查原值判断是否真的缺失。 */
+function valueAtPath(input: unknown, path: PropertyKey[]): { found: boolean; value: unknown } {
+  let current = input
+  for (const key of path) {
+    if (current === null || typeof current !== "object" || !Object.hasOwn(current, key)) return { found: false, value: undefined }
+    current = (current as Record<PropertyKey, unknown>)[key]
+  }
+  return { found: true, value: current }
+}
+
+const TYPE_LABELS: Record<string, string> = { object: "对象", array: "数组", string: "字符串", number: "数字", integer: "整数", boolean: "布尔值", null: "null" }
+
+function receivedTypeLabel(value: unknown): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "数组"
+  return TYPE_LABELS[typeof value] ?? typeof value
+}
+
 /** 工具入参校验失败时给模型可执行的纠正线索：列出前几个缺失/非法字段，不含参数内容本身。 */
 export function toolInputIssueHint(tools: ToolSet, toolName: string, input: unknown): string | null {
   const schema = tools[toolName]?.inputSchema
@@ -157,7 +235,11 @@ export function toolInputIssueHint(tools: ToolSet, toolName: string, input: unkn
   if (parsed.success) return null
   const issues = parsed.error.issues.slice(0, 3).map(issue => {
     const path = issue.path.join(".") || "(整体)"
-    return issue.code === "invalid_type" && issue.input === undefined ? `缺少 ${path}` : `${path}: ${issue.message}`
+    if (issue.code !== "invalid_type") return `${path}: ${issue.message}`
+    const { found, value } = valueAtPath(input, issue.path)
+    if (!found) return `缺少 ${path}`
+    const expected = "expected" in issue && typeof issue.expected === "string" ? TYPE_LABELS[issue.expected] ?? issue.expected : "该类型"
+    return `${path}: 应为${expected}，实际为${receivedTypeLabel(value)}`
   })
   return issues.length ? issues.join("；") : null
 }
