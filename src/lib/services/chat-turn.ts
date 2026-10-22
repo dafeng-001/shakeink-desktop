@@ -31,6 +31,10 @@ export class ChatProtocolError extends ContentError {
 class NavigationContentStaleError extends Error {
   constructor(readonly reason: ContentError) { super(reason.message) }
 }
+/** 内部标记：待答问题本身已不可消费（提案/调整范围变化）；事务回滚后在请求级把该交互置终态，避免重载复活与 QUESTION_PENDING 死锁。 */
+class StaleInteractionError extends Error {
+  constructor(readonly reason: ChatProtocolError, readonly turnId: string, readonly interactionId: string, readonly revision: number) { super(reason.message) }
+}
 export function scopeFor(conversation: Conversation, turn: ChatTurn, attempt: ChatAttempt): ChatExecutionScope {
   return { userId: turn.userId, conversationId: conversation.id, turnId: turn.id, attemptId: attempt.id, epoch: attempt.executionEpoch,
     taskDefaults: restoreTaskDefaults(attempt.defaultsSnapshot) ?? restoreTaskDefaults(turn.defaultsSnapshot) ?? legacyTaskDefaults(conversation.modelId, conversation.thinkingEffort) }
@@ -215,6 +219,7 @@ export async function beginChatRequest(userId: string, raw: unknown) {
     }
     let interactionTurn: ChatTurn | null = null
     let interaction: ChatInteraction | null = null
+    const requestedInteraction = input.interaction
     if (input.interaction) {
       interactionTurn = await tx.chatTurn.findFirst({ where: { id: input.interaction.turnId, userId, conversationId: conversation.id } })
       interaction = interactionTurn?.interaction as unknown as ChatInteraction | null
@@ -265,7 +270,12 @@ export async function beginChatRequest(userId: string, raw: unknown) {
         if (carried.success) {
           const verified = await validateStoredPlanningAdjustment(tx, carried.data, userId, conversation.id, conversation.novelId)
           const answer = questionAnswer(interaction.payload, input.message ?? "")
-          if (!verified || !answer) throw new ChatProtocolError("INTERACTION_STALE", "原提案或调整范围已变化，请重新核对")
+          if (!verified || !answer) {
+            const reason = new ChatProtocolError("INTERACTION_STALE", "原提案或调整范围已变化，请重新核对")
+            throw requestedInteraction
+              ? new StaleInteractionError(reason, requestedInteraction.turnId, requestedInteraction.id, requestedInteraction.revision)
+              : reason
+          }
           confirmedAction = { kind: "question", planningAdjustment: { ...verified, phase: "refine", answer } }
         } else if (interactionTurn) {
           const adjustment = await bindStoredPlanningAdjustment(tx, interactionTurn, conversation.novelId, input.message ?? "")
@@ -298,6 +308,12 @@ export async function beginChatRequest(userId: string, raw: unknown) {
     return { replay: false as const, turn: currentTurn, attempt, conversation }
     // 回合建立事务含 consumeStoryTask 的全量产物图读取：48 章规模下把上限放宽到 30s，慢读不应让面板消费 500。
   }, { ...CHAT_TRANSACTION_OPTIONS, timeout: 30_000 }).catch(async (error: unknown) => {
+    // 待答问题本身已不可消费：事务已回滚，换独立事务把该交互置终态（skipped/succeeded），
+    // 避免重载复活旧面板、后续消息被 QUESTION_PENDING 拦住。并发已回答/已跳过时保留原错误。
+    if (error instanceof StaleInteractionError) {
+      await closeStaleInteraction(userId, error.turnId, error.interactionId, error.revision)
+      throw error.reason
+    }
     // 导航面板内容过期的请求级自愈：消费事务已回滚，换独立事务把该面板刷新到当前版本（revision+1），
     // 引导作者重新选择；刷新不了（已回答/会话占用等）保留原错误。
     if (error instanceof NavigationContentStaleError && input.interaction) {
@@ -306,6 +322,12 @@ export async function beginChatRequest(userId: string, raw: unknown) {
         throw new ContentError("NAVIGATION_REFRESHED", "作品内容刚有变化，该面板的选项已刷新为当前版本，请重新选择。", 409)
       } catch (healError) {
         if (healError instanceof ContentError && healError.code === "NAVIGATION_REFRESHED") throw healError
+        // 刷新失败则面板仍不可消费：同路径置终态，避免留下 pending 死面板。
+        // 终态后统一以 INTERACTION_STALE 告知客户端关闭旧面板（原始 VERSION_CONFLICT 可能是审批/计划冲突，不能外推）。
+        if (error.reason.code === "INTERACTION_STALE" || error.reason.code === "VERSION_CONFLICT") {
+          await closeStaleInteraction(userId, input.interaction.turnId, input.interaction.id, input.interaction.revision)
+          throw new ChatProtocolError("INTERACTION_STALE", error.reason.message)
+        }
         throw error.reason
       }
     }
@@ -450,4 +472,10 @@ export async function skipChatInteraction(userId: string, turnId: string, id: st
     await tx.chatTurn.update({ where: { id: turnId }, data: { status: "succeeded", interaction: { ...interaction, state: "skipped" } as unknown as Prisma.InputJsonValue } })
   }, CHAT_TRANSACTION_OPTIONS)
   return getChatTurn(userId, turnId)
+}
+
+/** 请求级失效收尾：把不可消费的待答交互置终态；失败只记录，不覆盖真实状态。 */
+async function closeStaleInteraction(userId: string, turnId: string, interactionId: string, revision: number) {
+  try { await skipChatInteraction(userId, turnId, interactionId, revision) }
+  catch (error) { console.warn("[chat-turn] 失效交互置终态失败，保留原错误：", turnId, error instanceof Error ? error.message : error) }
 }

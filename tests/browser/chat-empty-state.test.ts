@@ -46,7 +46,7 @@ globalThis.mountChatEmpty=(options={})=>{
   newConversationRequested:false,newConversationPayload:null,draft:'',draftNovelId:null,pendingNovelTitle:null,pendingNovelPosition:null,novelCreationRequestId:null,
   creatingNovel:false,isGenerating:false,suspendedExecution:false,pendingQuestion:null,pendingPlan:null,pendingRequest:null,queuedMessages:[],queuePaused:false,
   modelChoice:{modelId:null,effort:null},modelChoiceExplicit:false,mode:'standard',modeExplicit:false});
- const calls=[],loads=new Map(),gates=new Map();let models=options.models===false?[]:[model],defaultModelId=options.responseDefault?model.id:null,wizardError=false,storageWriteFails=false,lastLoaded=null;
+ const calls=[],loads=new Map(),gates=new Map();let models=options.models===false?[]:[model],defaultModelId=options.responseDefault?model.id:null,wizardError=false,storageWriteFails=false,lastLoaded=null,chatReject=null;
  const nativeStorageSet=Storage.prototype.setItem;
  Storage.prototype.setItem=function(key,value){if(storageWriteFails&&key===chatSessionKey('fixture-author'))throw Error('controlled fixture storage failure');return nativeStorageSet.call(this,key,value)};
  const client=new QueryClient({defaultOptions:{queries:{retry:false,staleTime:0},mutations:{retry:false}}});
@@ -60,6 +60,7 @@ globalThis.mountChatEmpty=(options={})=>{
   if(path==='/api/chat/conversations'&&method==='GET')return json({conversations:[]});
   if(path.startsWith('/api/templates/wizard')&&method==='GET')return wizardError?json({error:'合成本地模板读取失败'},500):json({templates:[],revision:1});
   if(path==='/api/chat'&&method==='POST'){
+   if(chatReject)return json({error:chatReject.message,code:chatReject.code},409);
    const events=[{type:'start',messageId:'fixture-assistant'},{type:'text-start',id:'fixture-text'},{type:'text-delta',id:'fixture-text',delta:'受控组件响应'},{type:'text-end',id:'fixture-text'},{type:'finish',finishReason:'stop'}];
    return new Response(events.map(e=>'data: '+JSON.stringify(e)+'\\n\\n').join(''),{headers:{'content-type':'text/event-stream','X-Conversation-Id':'fixture-sent-conversation'}});
   }
@@ -104,6 +105,7 @@ globalThis.mountChatEmpty=(options={})=>{
   external:(text,novelId,options)=>dispatchChatSendMessage(text,novelId,options),
   request:id=>useChatStore.getState().requestConversation(id),newDraft:payload=>useChatStore.getState().requestNewConversation(payload),
   response:(id,status=200,extra={})=>loads.set(id,{status,body:status===200?detail(id,extra):{error:'合成加载失败'}}),reject:id=>loads.set(id,{reject:'合成网络失败'}),
+  chatReject:(code,message)=>{chatReject={code,message}},
   defer:id=>{let release;const promise=new Promise(yes=>release=yes);gates.set(id,{promise,release})},release:id=>{const gate=gates.get(id);gate.release();gates.delete(id)},
   select:value=>flushSync(()=>useCardSelection.setState({selection:value})),
   wizardFailure:value=>{wizardError=value;return client.invalidateQueries({queryKey:['desktop','wizard-templates']})},
@@ -732,4 +734,34 @@ test("CES-11e a failed skip falls back to the queue with the question and intent
   assert.match(state.queuedMessages[0].text, /为基础改进，再抽 3 份候选/)
   assert.ok(state.pendingQuestion, "the unanswered question survives a failed skip")
   assert.equal(await page.getByTestId("candidate-action-panel").isVisible(), true)
+}))
+
+// --- CES-12: 失效 interaction 不得复活问答面板（interaction-stale-terminal 2026-10-21） ---
+// 修复前：提交答案撞 409 INTERACTION_STALE 后，错误卡显示「生成中断」且旧问答面板恢复；
+// 修复后：面板关闭、已填答案回填输入框、错误卡改称「提问已失效」且不提供「作为新消息重发」。
+test("CES-12 stale answer closes the panel, keeps the filled answer and labels the card as expired", () => scenario({}, async page => {
+  await page.evaluate(() => {
+    const f = (window as any).f
+    f.choose()
+    f.patch({ pendingQuestion: {
+      markerStyle: "letters",
+      questions: [{ question: "合成待答问题", options: ["合成选择"] }],
+      interaction: { turnId: "ces12-turn", id: "ces12-ia", revision: 1, action: "answer" },
+    } })
+    f.chatReject("INTERACTION_STALE", "原提案或调整范围已变化，请重新核对")
+  })
+  await page.getByTestId("ask-user-panel").waitFor()
+  await page.getByTestId("ask-option-0-0").click()
+  await page.waitForFunction(ces11ChatDone)
+  await frames(page)
+  const state = await page.evaluate(() => (window as any).f.state())
+  assert.equal(state.pendingQuestion, null, "the stale question panel must close")
+  assert.equal(state.isGenerating, false)
+  const expected = "【回答问题】合成待答问题\n我的回答：合成选择"
+  assert.equal(state.draft, expected, "the filled answer must be backfilled")
+  assert.equal(await page.evaluate(() => (window as any).f.source()), expected, "the composer must show the backfilled answer")
+  assert.equal(await page.getByTestId("ask-user-panel").count(), 0)
+  assert.equal(await page.getByText("提问已失效", { exact: true }).count(), 1, "the card must not claim generation was interrupted")
+  assert.equal(await page.getByText("生成中断", { exact: true }).count(), 0)
+  assert.equal(await page.getByRole("button", { name: "作为新消息重发" }).count(), 0)
 }))

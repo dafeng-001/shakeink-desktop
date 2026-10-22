@@ -12,7 +12,7 @@ import { toast } from "sonner"
 
 import { ChatSessionRepository, emptyChatSession, browserSessionStorage } from "@/lib/chat-session"
 import { FramePublisher, parseChatParts, type ChatAction, type PlanProposal } from "@/lib/chat-parts"
-import { connectionFeedback, type ChatInteraction } from "@/lib/chat-protocol"
+import { connectionFeedback, STALE_INTERACTION_CODES, type ChatInteraction } from "@/lib/chat-protocol"
 import { classifyWireError, ERROR_TEXT } from "@/lib/ai/error-classification"
 import { readSSE } from "@/lib/sse"
 import { ChatExecutionController, finalizeAttempt, reduceChatStream, startChatStream } from "@/lib/chat-stream"
@@ -487,6 +487,8 @@ export function useAgentChat(userId: string) {
       interaction: recovery ? undefined : approval ?? store.pendingQuestion?.interaction, action: recovery ? undefined : store.draftAction ?? undefined,
       ...(stagedBatches.length > 0 ? { stagedChanges: stagedBatches } : {}) }
     const body = store.pendingRequest?.body ?? JSON.stringify(requested)
+    // pendingRequest 重放时 requested.interaction 可能为空：一律以实际发送体判定本次是否在回答交互。
+    const sentInteraction = (JSON.parse(body) as { interaction?: unknown }).interaction
     if (store.pendingRequest && (JSON.parse(body).message !== message || JSON.stringify(JSON.parse(body).storySelection) !== JSON.stringify(storySelection)) && !recovery) {
       execution.end(token); toast.error("上次发送结果待确认，请先核对上次发送"); return false
     }
@@ -687,7 +689,10 @@ export function useAgentChat(userId: string) {
       if (serverTurnId && useChatStore.getState().conversationId === conversationId) { setFollowing(serverTurnId); await reconcile(serverTurnId).catch(() => {}) }
     } catch (error) {
       if (execution.owns(token)) {
-        if (!accepted) { pendingQuestion = store.pendingQuestion; pendingPlan = store.pendingPlan }
+        // 确定性失效（提案/选项已变化等）不得恢复旧问答面板：服务端已/将把该交互置终态，
+        // 恢复只会让用户反复提交同一个死问题。网络/5xx/其他 4xx 仍保留可重试语义。
+        const staleInteraction = !!sentInteraction && STALE_INTERACTION_CODES.has(submitErrorCode ?? "")
+        if (!accepted && !staleInteraction) { pendingQuestion = store.pendingQuestion; pendingPlan = store.pendingPlan }
         const text = error instanceof Error && /[\u4e00-\u9fff]/.test(error.message) ? error.message : ERROR_TEXT.connectionLostSaved
         finish("interrupted", text, submitErrorCode ?? "STREAM_INTERRUPTED")
         if (serverTurnId) { setFollowing(serverTurnId); await reconcile(serverTurnId).catch(() => {}) }

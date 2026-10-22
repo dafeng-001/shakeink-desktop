@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import { transformSync } from "esbuild"
 import { ChatExecutionController } from "../../src/lib/chat-stream"
+import { STALE_INTERACTION_CODES } from "../../src/lib/chat-protocol"
 import { chatTaskOverrides, newChatChoices, restoreChatChoices } from "../../src/lib/desktop/chat-defaults"
 import { defaultState } from "../../desktop/core/settings"
 import { taskDefaultsSchema, freezeTaskDefaults } from "../../desktop/shared/task-defaults"
@@ -36,7 +37,7 @@ function controlledHook() {
     if (name === "@/lib/chat-session") return { ChatSessionRepository: class {}, browserSessionStorage: () => null }
     if (name === "@/lib/chat-stream") return { ChatExecutionController, startChatStream: (id: string) => ({ message: { id, role: "assistant", toolCalls: [] }, status: "running", writeStarted: false }), finalizeAttempt: (s: any, status: string) => ({ ...s, status }), reduceChatStream: (s: unknown) => s }
     if (name === "@/lib/chat-parts") return { FramePublisher: SilentPublisher, parseChatParts: () => [] }
-    if (name === "@/lib/chat-protocol") return { connectionFeedback: () => "ok" }
+    if (name === "@/lib/chat-protocol") return { connectionFeedback: () => "ok", STALE_INTERACTION_CODES }
     if (name === "@/lib/ai/error-classification") return { ERROR_TEXT: {}, classifyWireError: () => ({ message: "fixture" }) }
     if (name === "@/stores/staged-changes") return { useStagedChangesStore: { getState: () => ({ takeForSend: () => [], markSent() {} }) } }
     if (name === "@/stores/story-activity") return { useStoryActivityStore: { getState: () => ({ activity: null }), setState() {} } }
@@ -101,4 +102,45 @@ test("accepted defaults retain an explicit choice and mode changed while the sub
   f.state.modelChoice = { modelId: "next-explicit-model", effort: "high" }; f.state.modelChoiceExplicit = true; f.state.mode = "plan"; f.state.modeExplicit = true
   body.resolve({ ...turn(), turn: { ...turn().turn, defaultsSnapshot: freezeTaskDefaults({ ...defaultState.settings.agent, textModelId: "accepted-model" }, 1) } }); await running
   assert.deepEqual(f.state.modelChoice, { modelId: "next-explicit-model", effort: "high" }); assert.equal(f.state.mode, "plan")
+}))
+
+/** 待答问答夹具：完整 interaction 与 AskUserPanel 提交文本一致 */
+function pendingQuestionFixture() {
+  return { markerStyle: "letters" as const, questions: [{ question: "合成待答问题", options: ["合成选择"] }],
+    interaction: { turnId: "turn-pending", id: "ia-pending", revision: 1, action: "answer" as const } }
+}
+
+test("失效 interaction 的 4xx 不得复活待答问答面板", async () => withFetch(async () => {
+  for (const code of ["INTERACTION_STALE", "INTERACTION_CONSUMED", "NAVIGATION_REFRESHED"]) {
+    globalThis.fetch = async () => new Response(JSON.stringify({ code, error: "fixture" }), { status: 409 })
+    const f = controlledHook(); f.state.pendingQuestion = pendingQuestionFixture()
+    const accepted = await f.hook.send("【回答问题】合成待答问题\n我的回答：合成选择", "novel-a")
+    assert.equal(accepted, false)
+    assert.equal(f.state.pendingQuestion, null, code + " 必须关闭旧问答面板")
+    assert.equal(f.state.isGenerating, false)
+  }
+}))
+
+test("网络失败仍恢复待答问答面板以便重试", async () => withFetch(async () => {
+  globalThis.fetch = async () => { throw new TypeError("fetch failed") }
+  const f = controlledHook(); const pending = pendingQuestionFixture(); f.state.pendingQuestion = pending
+  await f.hook.send("【回答问题】合成待答问题\n我的回答：合成选择", "novel-a")
+  assert.deepEqual(f.state.pendingQuestion, pending)
+  assert.equal(f.state.isGenerating, false)
+}))
+
+test("非失效 4xx 仍恢复待答问答面板，白名单不误伤", async () => withFetch(async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ code: "INTERACTION_ACTION_INVALID", error: "交互动作不匹配" }), { status: 409 })
+  const f = controlledHook(); const pending = pendingQuestionFixture(); f.state.pendingQuestion = pending
+  await f.hook.send("【回答问题】合成待答问题\n我的回答：合成选择", "novel-a")
+  assert.deepEqual(f.state.pendingQuestion, pending)
+  assert.equal(f.state.isGenerating, false)
+}))
+
+test("VERSION_CONFLICT 仍恢复待答问答面板，保留「查看最新选项」路径", async () => withFetch(async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ code: "VERSION_CONFLICT", error: "审批或计划内容已变化" }), { status: 409 })
+  const f = controlledHook(); const pending = pendingQuestionFixture(); f.state.pendingQuestion = pending
+  await f.hook.send("【回答问题】合成待答问题\n我的回答：合成选择", "novel-a")
+  assert.deepEqual(f.state.pendingQuestion, pending)
+  assert.equal(f.state.isGenerating, false)
 }))

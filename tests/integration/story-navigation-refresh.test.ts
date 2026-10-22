@@ -194,3 +194,27 @@ test("STALE-06 反向边界：内容清空仍诚实失败", async () => {
     )
   })
 })
+
+test("STALE-07 端到端：导航刷新失败也把交互置终态", async () => {
+  const seed = await seedCommon()
+  await run(async () => {
+    await updateItem(seed.itemA.id, { name: seed.itemA.name, description: "", appearance: "", acquisition: "", effects: [], attributes: [] })
+    await assert.rejects(
+      beginChatRequest(seed.scope.userId, {
+        clientRequestId: `answer-${randomUUID()}`,
+        conversationId: seed.conversation.id,
+        interaction: { turnId: seed.turn.id, id: seed.interactionId, revision: 1, action: "answer" },
+        storySelection: { kind: "choice", choiceId: seed.sceneChoiceId },
+        message: "生成场景",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof ContentError)
+        assert.equal(error.code, "INTERACTION_STALE")
+        return true
+      },
+    )
+    const panel = await prisma.chatTurn.findUniqueOrThrow({ where: { id: seed.turn.id } })
+    assert.equal(panel.status, "succeeded")
+    assert.equal((panel.interaction as { state?: string } | null)?.state, "skipped")
+  })
+})

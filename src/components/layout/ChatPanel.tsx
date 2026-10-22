@@ -120,6 +120,7 @@ import { canShowChatWelcome, hasSelectedModel, quickPromptSuffix, type QuickProm
 import type { WizardPreset } from "@/lib/creation-wizard/presets"
 import "@/components/chat/chat-empty-dock.css"
 import { classifyWireError, type ErrorUserAction } from "@/lib/ai/error-classification"
+import { STALE_INTERACTION_CODES } from "@/lib/chat-protocol"
 import { CHAT_FOCUS_COMPOSER_EVENT, CHAT_OPEN_MODEL_PICKER_EVENT, CHAT_SEND_MESSAGE_EVENT, dispatchChatUiEvent } from "@/components/chat/ui-events"
 import {
   editorToText,
@@ -580,6 +581,14 @@ const ERROR_CARD_TITLES: Record<ErrorUserAction, (category: string) => string | 
 /** 用户主动停止（本地停止/服务端取消/执行中断）不是错误：渲染中性状态，不用报错样式 */
 const USER_STOPPED_CODES = new Set(["USER_STOPPED", "USER_CANCELLED", "EXECUTION_INTERRUPTED"])
 
+/** 交互失效不是「生成中断」：仅本地被拒发送（无 turnId）按 wire code 显示准确标题，不重放旧 interaction。
+    新增失效码时须与 lib/chat-protocol.ts 的 STALE_INTERACTION_CODES 同步。 */
+const STALE_INTERACTION_TITLES: Record<string, string> = {
+  INTERACTION_STALE: "提问已失效",
+  INTERACTION_CONSUMED: "提问已处理",
+  NAVIGATION_REFRESHED: "选项已更新",
+}
+
 /** 助手消息：Worked 行（可展开 work-log 工具调用列表）+ Markdown 正文 + 错误块 + 本次改动卡片 */
 function AttemptHistory({ historical, children }: { historical: boolean; children: React.ReactNode }) {
   return historical ? <details className="rounded-card border border-border p-3"><summary className="cursor-pointer text-xs text-muted-foreground">历史尝试 · 只读记录</summary><div className="mt-3">{children}</div></details> : children
@@ -640,6 +649,8 @@ function AssistantMessage({
   // 错误卡按统一错误分类的 userAction 渲染标题与行动按钮（分类见 lib/ai/error-classification.ts）
   const errorClassified = message.error ? classifyWireError(message.errorCode, message.error) : null
   const errorTitle = !errorClassified ? null : ERROR_CARD_TITLES[errorClassified.userAction](errorClassified.category)
+  /** 仅本地被拒发送：带 turnId 的服务端终态保持原「生成中断/重试本轮」语义 */
+  const staleInteractionTitle = !message.turnId && message.errorCode ? STALE_INTERACTION_TITLES[message.errorCode] : undefined
 
   return (
     <div data-mid={message.id} className="chat-msg-enter group relative flex flex-col gap-2.5">
@@ -772,7 +783,7 @@ function AssistantMessage({
         <div role="status" className="flex w-full flex-col gap-1.5 rounded-card border border-destructive/25 bg-destructive/6 px-3.5 py-2.5">
           <div className="flex items-center gap-1.5 text-[13px] font-semibold text-destructive">
             <AlertCircle className="size-4 shrink-0" />
-            {errorTitle ?? (message.status === "interrupted" ? (message.errorCode === "USER_STOPPED" ? "已停止" : "生成中断") : "生成失败")}
+            {staleInteractionTitle ?? errorTitle ?? (message.status === "interrupted" ? (message.errorCode === "USER_STOPPED" ? "已停止" : "生成中断") : "生成失败")}
           </div>
           <p className="line-clamp-2 text-[12.5px] leading-[1.6] text-foreground/80">
             {message.error}
@@ -815,7 +826,7 @@ function AssistantMessage({
                 修改输入
               </button>
             )}
-            {onResend && errorClassified.userAction !== "recharge" && errorClassified.userAction !== "edit_input" && (
+            {onResend && !staleInteractionTitle && errorClassified.userAction !== "recharge" && errorClassified.userAction !== "edit_input" && (
               <button
                 type="button"
                 onClick={onResend}
@@ -1868,7 +1879,7 @@ export function ChatPanel({
                     entityIndex={entityIndex}
                     novelId={entityNovelId}
                     onResend={m.error && mi === messages.length - 1 && (m.turnId ? m.canRetry || m.canResume : !m.hasWriteEffects) && !isGenerating ? handleResend : undefined}
-                    onRefreshNavigation={m.error && mi === messages.length - 1 && !m.turnId && ["VERSION_CONFLICT", "INTERACTION_STALE", "NAVIGATION_REFRESHED"].includes(m.errorCode ?? "") && conversationId ? () => void loadConversation(conversationId) : undefined}
+                    onRefreshNavigation={m.error && mi === messages.length - 1 && !m.turnId && (STALE_INTERACTION_CODES.has(m.errorCode ?? "") || m.errorCode === "VERSION_CONFLICT") && conversationId ? () => void loadConversation(conversationId) : undefined}
                     askSummary={deriveAskSummary(messages, mi, askPanelPending)}
                     thinkingOpen={
                       isGenerating && m.streaming === true ? thinkingOpen : undefined
