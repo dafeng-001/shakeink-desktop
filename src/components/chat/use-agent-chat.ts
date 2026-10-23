@@ -487,15 +487,16 @@ export function useAgentChat(userId: string) {
       interaction: recovery ? undefined : approval ?? store.pendingQuestion?.interaction, action: recovery ? undefined : store.draftAction ?? undefined,
       ...(stagedBatches.length > 0 ? { stagedChanges: stagedBatches } : {}) }
     const body = store.pendingRequest?.body ?? JSON.stringify(requested)
+    const sentBody = JSON.parse(body) as { interaction?: unknown; message?: string; storySelection?: unknown; stagedChanges?: typeof stagedBatches }
     // pendingRequest 重放时 requested.interaction 可能为空：一律以实际发送体判定本次是否在回答交互。
-    const sentInteraction = (JSON.parse(body) as { interaction?: unknown }).interaction
-    if (store.pendingRequest && (JSON.parse(body).message !== message || JSON.stringify(JSON.parse(body).storySelection) !== JSON.stringify(storySelection)) && !recovery) {
+    const sentInteraction = sentBody.interaction
+    if (store.pendingRequest && (sentBody.message !== message || JSON.stringify(sentBody.storySelection) !== JSON.stringify(storySelection)) && !recovery) {
       execution.end(token); toast.error("上次发送结果待确认，请先核对上次发送"); return false
     }
     // A new activity supersedes an abandoned load only after send preflight.
     // Rejected submissions keep the failed navigation target visible.
     setConversationLoadError(null)
-    const transmittedBatches = (JSON.parse(body) as {stagedChanges?: typeof stagedBatches}).stagedChanges ?? []
+    const transmittedBatches = sentBody.stagedChanges ?? []
     if (transmittedBatches.length) useStagedChangesStore.getState().markSent(transmittedBatches.map(b => b.batchKey), transmittedBatches, true)
     useChatStore.setState({ pendingRequest: store.pendingRequest ?? { clientRequestId: requested.clientRequestId, body }, isGenerating: true, suspendedExecution: true, recoveryNotice: null, pendingQuestion: null, pendingPlan: null, queuePaused: true })
     const initial = state.message

@@ -10,11 +10,14 @@ export const CHAT_LEASE_MS = 60_000
 export const CHAT_STALE_MS = 45_000
 export const CHAT_SLOW_MS = 90_000
 /** 服务端判定当前交互不可再消费的 wire code：前端不得恢复旧面板，也不得重放同一 interaction。 */
-export const STALE_INTERACTION_CODES: ReadonlySet<string> = new Set([
+const STALE_INTERACTION_CODE_LIST = [
   "INTERACTION_STALE",
   "INTERACTION_CONSUMED",
   "NAVIGATION_REFRESHED",
-])
+] as const
+/** UI 标题表用该类型做编译期覆盖检查；新增失效码必须同时补齐标题。 */
+export type StaleInteractionCode = (typeof STALE_INTERACTION_CODE_LIST)[number]
+export const STALE_INTERACTION_CODES: ReadonlySet<string> = new Set(STALE_INTERACTION_CODE_LIST)
 /** 租约过期后的宽限窗口：执行方条件写可重新获租，无本机执行器存活证明时，轮询方过宽限才回收 */
 export const RECLAIM_GRACE_MS = 10_000
 export const chatRequestSchema = z.object({
